@@ -86,7 +86,7 @@ export async function signup(
 
   // First registration becomes the agency super admin.
   if (data.user) {
-    await markAsSuperAdmin(data.user.id);
+    await markAsSuperAdmin(data.user.id, parsed.data.email);
   }
 
   redirect("/login?message=Revisa%20tu%20email");
