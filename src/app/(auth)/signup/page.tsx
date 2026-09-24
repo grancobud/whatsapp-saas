@@ -7,6 +7,11 @@ export const metadata: Metadata = {
   title: "Crear cuenta — Agente WhatsApp",
 };
 
+// The gate depends on live data (does any user exist yet?). Without this the
+// page has no dynamic API usage, so Next prerenders it at build time — when
+// there are zero users — and keeps serving the signup form forever.
+export const dynamic = "force-dynamic";
+
 export default async function SignupPage() {
   // Invite-only after bootstrap: once the admin account exists, no public signup.
   if (!(await isSignupOpen())) {
