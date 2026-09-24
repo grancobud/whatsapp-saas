@@ -131,7 +131,12 @@ export SUPABASE_ACCESS_TOKEN='sbp_...'
 node scripts/setup.mjs site-url
 ```
 
-Esto setea **Site URL** + **Redirect URLs** a tu dominio de Vercel. Si el usuario
+Esto setea **Site URL** + **Redirect URLs** a tu dominio de Vercel.
+
+> ⚠️ Ese token (`sbp_...`) da acceso a **todos** los proyectos de la cuenta de Supabase,
+> no solo a este. Úsalo para los pasos 7 y 9 y **revócalo al terminar**
+> (https://supabase.com/dashboard/account/tokens → Revoke). Cierra también la terminal
+> para que la variable exportada no quede viva. Si el usuario
 prefiere no usar token, hazlo manual: Supabase → **Authentication → URL
 Configuration** → Site URL = tu URL, Redirect = `<url>/**`.
 (Sin esto, el login y el reset de contraseña redirigen mal.)

@@ -5,12 +5,20 @@
       "Bash(node --version)",
       "Bash(node scripts/setup.mjs:*)",
       "Bash(node scripts/seed-admin.mjs:*)",
-      "Bash(npm install:*)",
-      "Bash(npm ci:*)",
-      "Bash(npm run:*)",
-      "Bash(supabase:*)",
-      "Bash(vercel:*)",
-      "Bash(brew install supabase/tap/supabase)"
+      "Bash(npm install)",
+      "Bash(npm ci)",
+      "Bash(npm run build)",
+      "Bash(npm run lint)",
+      "Bash(npm run typecheck)",
+      "Bash(npm run dev)",
+      "Bash(supabase login)",
+      "Bash(supabase link:*)",
+      "Bash(supabase db push)",
+      "Bash(supabase migration list:*)",
+      "Bash(vercel login)",
+      "Bash(vercel link)",
+      "Bash(vercel --prod)",
+      "Bash(vercel env ls:*)"
     ]
   }
 }
