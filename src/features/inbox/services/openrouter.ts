@@ -41,6 +41,17 @@ import type {
 import { registry } from "@/features/tools/index";
 import { getActiveAgent } from "@/features/agents/services/active-agent";
 import { decryptCredentials } from "@/shared/lib/integration-secrets";
+import {
+  buildModelChain,
+  runWithModelChain,
+  EmptyReplyError,
+  DEFAULT_FALLBACK_CHAIN,
+} from "./model-chain";
+
+function logFallback(where: string) {
+  return (a: { model: string; error: string }, next: string) =>
+    console.warn(`[openrouter:${where}] ${a.model} fallo (${a.error}); pruebo ${next}`);
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // getWorkspaceModel
@@ -79,7 +90,7 @@ export async function getWorkspaceModel(workspaceId: string): Promise<string> {
     // Non-fatal — fall through to env default
   }
 
-  return process.env.OPENROUTER_DEFAULT_MODEL ?? "openai/gpt-4o-mini";
+  return process.env.OPENROUTER_DEFAULT_MODEL ?? DEFAULT_FALLBACK_CHAIN[0];
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -126,6 +137,8 @@ export interface GenerateReplyResult {
   text: string;
   promptTokens: number;
   completionTokens: number;
+  /** The model that actually answered (may differ from the requested one after a fallback). */
+  modelUsed?: string;
 }
 
 interface GenerateReplyParams {
@@ -164,14 +177,24 @@ export async function generateReply(
     },
   });
 
-  const result = await generateText({
-    model: openrouter.chat(modelId),
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userMessage },
-    ],
-    maxOutputTokens: 1024,
-  });
+  const { result, model: modelUsed } = await runWithModelChain(
+    buildModelChain(modelId),
+    async (m) => {
+      const r = await generateText({
+        model: openrouter.chat(m),
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userMessage },
+        ],
+        // Un solo reintento por modelo: si sigue fallando, conviene pasar al siguiente de la cadena.
+        maxRetries: 1,
+        maxOutputTokens: 1024,
+      });
+      if (!r.text.trim()) throw new EmptyReplyError(m);
+      return r;
+    },
+    { onFallback: logFallback("reply") },
+  );
 
   // AI SDK v6 exposes inputTokens / outputTokens; map to stable naming
   const promptTokens = result.usage?.inputTokens ?? 0;
@@ -181,6 +204,7 @@ export async function generateReply(
     text: result.text,
     promptTokens,
     completionTokens,
+    modelUsed,
   };
 }
 
@@ -220,6 +244,8 @@ export async function generateChatReply(params: {
   });
 
   // Bridge Forge tools → AI SDK ToolSet (same shape as generateWithTools).
+  // `toolsRan` blocks the model fallback once a tool had side effects.
+  let toolsRan = false;
   const aiTools: ToolSet = {};
   if (params.tools && params.toolContext) {
     const ctx = params.toolContext;
@@ -227,30 +253,43 @@ export async function generateChatReply(params: {
       aiTools[forgeTool.name] = tool({
         description: forgeTool.description,
         inputSchema: zodSchema(forgeTool.schema),
-        execute: async (args: unknown): Promise<unknown> =>
-          registry.run(forgeTool.name, args, ctx),
+        execute: async (args: unknown): Promise<unknown> => {
+          toolsRan = true;
+          return registry.run(forgeTool.name, args, ctx);
+        },
       });
     }
   }
   const hasTools = Object.keys(aiTools).length > 0;
 
-  const result = await withTransientRetry(() =>
-    generateText({
-      model: openrouter.chat(modelId),
-      messages: [
-        { role: "system", content: params.systemPrompt },
-        ...params.messages,
-      ],
-      tools: hasTools ? aiTools : undefined,
-      stopWhen: hasTools ? stepCountIs(5) : undefined,
-      maxOutputTokens: params.maxOutputTokens ?? 512,
-    }),
+  const { result, model: modelUsed } = await runWithModelChain(
+    buildModelChain(modelId),
+    async (m) => {
+      const r = await withTransientRetry(() =>
+        generateText({
+          model: openrouter.chat(m),
+          messages: [
+            { role: "system", content: params.systemPrompt },
+            ...params.messages,
+          ],
+          tools: hasTools ? aiTools : undefined,
+          stopWhen: hasTools ? stepCountIs(5) : undefined,
+          // Un solo reintento por modelo: si sigue fallando, conviene pasar al siguiente de la cadena.
+        maxRetries: 1,
+        maxOutputTokens: params.maxOutputTokens ?? 512,
+        }),
+      );
+      if (!r.text.trim() && !toolsRan) throw new EmptyReplyError(m);
+      return r;
+    },
+    { hasSideEffects: () => toolsRan, onFallback: logFallback("chat") },
   );
 
   return {
     text: result.text,
     promptTokens: result.usage?.inputTokens ?? 0,
     completionTokens: result.usage?.outputTokens ?? 0,
+    modelUsed,
   };
 }
 
@@ -274,6 +313,8 @@ export interface GenerateWithToolsResult {
   inputTokens: number;
   outputTokens: number;
   toolCallsExecuted: number;
+  /** The model that actually answered (may differ from the requested one after a fallback). */
+  modelUsed?: string;
 }
 
 /**
@@ -307,6 +348,9 @@ export async function generateWithTools(
   // Each entry uses inputSchema (zodSchema wrapper) + execute — the correct v6 shape.
   // execute returns Promise<unknown> to satisfy ToolSet's output constraint.
   const aiTools: ToolSet = {};
+  // Once a tool ran (it may have booked, tagged or messaged), a failure must NOT
+  // be retried with another model: that would repeat the side effect.
+  let toolsRan = false;
 
   for (const forgeTool of params.availableTools ?? []) {
     const ctx = params.toolContext;
@@ -314,6 +358,7 @@ export async function generateWithTools(
       description: forgeTool.description,
       inputSchema: zodSchema(forgeTool.schema),
       execute: async (args: unknown): Promise<unknown> => {
+        toolsRan = true;
         return registry.run(forgeTool.name, args, ctx);
       },
     });
@@ -321,22 +366,34 @@ export async function generateWithTools(
 
   const hasTools = Object.keys(aiTools).length > 0;
 
-  const result = await generateText({
-    model: openrouter.chat(modelId),
-    messages: [
-      { role: "system", content: params.systemPrompt },
-      ...(params.history ?? []),
-      { role: "user", content: params.userMessage },
-    ],
-    tools: hasTools ? aiTools : undefined,
-    stopWhen: hasTools ? stepCountIs(5) : undefined,
-    maxOutputTokens: 1024,
-  });
+  // Same messages for every model in the chain: the conversation thread is kept.
+  const { result, model: modelUsed } = await runWithModelChain(
+    buildModelChain(modelId),
+    async (m) => {
+      const r = await generateText({
+        model: openrouter.chat(m),
+        messages: [
+          { role: "system", content: params.systemPrompt },
+          ...(params.history ?? []),
+          { role: "user", content: params.userMessage },
+        ],
+        tools: hasTools ? aiTools : undefined,
+        stopWhen: hasTools ? stepCountIs(5) : undefined,
+        // Un solo reintento por modelo: si sigue fallando, conviene pasar al siguiente de la cadena.
+        maxRetries: 1,
+        maxOutputTokens: 1024,
+      });
+      if (!r.text.trim() && !toolsRan) throw new EmptyReplyError(m);
+      return r;
+    },
+    { hasSideEffects: () => toolsRan, onFallback: logFallback("tools") },
+  );
 
   return {
     text: result.text,
     inputTokens: result.usage?.inputTokens ?? 0,
     outputTokens: result.usage?.outputTokens ?? 0,
     toolCallsExecuted: result.steps?.length ?? 0,
+    modelUsed,
   };
 }
